@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>マイクラ風オンライン</title>
+<style>
+body{margin:0;overflow:hidden;background:#87ceeb;}
+#crosshair{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:white;font-size:22px;pointer-events:none;font-family:sans-serif;}
+#msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#0008;color:white;padding:6px 12px;border-radius:6px;font-family:sans-serif;}
+#progressBarContainer{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);width:220px;height:12px;background:#0008;border-radius:6px;display:none;}
+#progressBar{width:0%;height:100%;background:#ffcc00;border-radius:6px;}
+</style>
+</head>
+<body>
+
+<div id="crosshair">+</div>
+<div id="msg">クリックして開始</div>
+<div id="progressBarContainer"><div id="progressBar"></div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+
+<script>
+// ===== Socket.IO接続 =====
+const socket = io();
+
+// プレイヤー移動同期
+function sendMove() {
+  socket.emit("move", {
+    x: camera.position.x,
+    y: camera.position.y,
+    z: camera.position.z,
+    yaw, pitch
+  });
+}
+
+// ブロック設置／破壊同期
+function addBlockOnline(x,y,z,type){
+  addBlock(x,y,z,type); 
+  socket.emit("blockChange",{x,y,z,type});
+}
+function removeBlockOnline(x,y,z){
+  removeBlockByMesh(blocks.get(`${x},${y},${z}`).mesh);
+  socket.emit("blockChange",{x,y,z,type:null});
+}
+
+// サーバーから同期情報受信
+socket.on("playerMove", ({id,data})=>{
+  // 他プレイヤー更新（ここで他プレイヤーモデルを動かす）
+});
+socket.on("blockChange", ({x,y,z,type})=>{
+  if(type) addBlock(x,y,z,type);
+  else removeBlockByMesh(blocks.get(`${x},${y},${z}`).mesh);
+});
+socket.on("initWorld", world=>{
+  for(const [k,type] of world) {
+    const [x,y,z] = k.split(",").map(Number);
+    addBlock(x,y,z,type);
+  }
+});
+socket.on("playerJoined", ({id})=>{
+  console.log("Player joined:", id);
+});
+socket.on("playerLeft", ({id})=>{
+  console.log("Player left:", id);
+});
+
+// ===== 以下、既存のマイクラ風Three.jsコード =====
+
+// ===== 設定 =====
+const CHUNK=3, RENDER=3;
+const PLAYER_H=1.5, PLAYER_W=0.3;
+const EYE_H=PLAYER_H;
+const GRAVITY=-9.8, JUMP=5, MOVE_SPEED=3;
+const WORLD_DEPTH=-6;
+
+// ===== Three.js =====
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87ceeb);
+scene.fog=new THREE.Fog(0x87ceeb,10,60);
+
+const camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,0.1,1000);
+const renderer=new THREE.WebGLRenderer({antialias:false});
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff,0.9));
+const sun=new THREE.DirectionalLight(0xffffff,0.7);
+sun.position.set(5,10,5);
+sun.castShadow = true;
+sun.shadow.mapSize.width = 2048;
+sun.shadow.mapSize.height = 2048;
+sun.shadow.camera.near = 0.5;
+sun.shadow.camera.far = 100;
+sun.shadow.camera.left = -20;
+sun.shadow.camera.right = 20;
+sun.shadow.camera.top = 20;
+sun.shadow.camera.bottom = -20;
+scene.add(sun);
+
+// ===== Pointer Lock =====
+let locked=false;
+document.body.addEventListener("click",()=>renderer.domElement.requestPointerLock());
+document.addEventListener("pointerlockchange",()=>{
+locked=document.pointerLockElement===renderer.domElement;
+document.getElementById("msg").style.display=locked?"none":"block";
+});
+
+// ===== 視点回転 =====
+let yaw=0,pitch=0;
+document.addEventListener("mousemove",e=>{
+if(!locked)return;
+yaw-=e.movementX*0.002;
+pitch-=e.movementY*0.002;
+pitch=Math.max(-Math.PI/2,Math.min(Math.PI/2,pitch));
+camera.rotation.order="YXZ";
+camera.rotation.y=yaw;
+camera.rotation.x=pitch;
+});
+
+// ===== 移動入力 =====
+const keys={};
+document.addEventListener("keydown",e=>keys[e.code]=true);
+document.addEventListener("keyup",e=>keys[e.code]=false);
+
+let velocityY=0;
+let onGround=false;
+
+// ===== マテリアル =====
+const boxGeo=new THREE.BoxGeometry(1,1,1);
+const mats={
+grass:0x4caf50,
+dirt:0x8b5a2b,
+stone:0x888888,
+wood:0x9c6b30,
+leaves:0x2e7d32,
+bedrock:0x222222
+};
+function makeMat(c){ return new THREE.MeshLambertMaterial({color:c});}
+
+// ===== ブロック管理 =====
+const blocks=new Map(), meshes=[];
+function key(x,y,z){return `${x},${y},${z}`;}
+function hasBlock(x,y,z){
+return blocks.has(key(Math.floor(x),Math.floor(y),Math.floor(z)));
+}
+
+function addBlock(x,y,z,type){
+const k=key(x,y,z);
+if(blocks.has(k)) return;
+
+const mesh=new THREE.Mesh(boxGeo,makeMat(mats[type]));
+mesh.position.set(x+0.5,y+0.5,z+0.5);
+mesh.castShadow = true;
+mesh.receiveShadow = true;
+scene.add(mesh);
+
+blocks.set(k,{mesh,type});
+meshes.push(mesh);
+}
+
+// 🔹チャンク生成後や可視化変更時に影を更新
+function updateAllBlockShadows(){
+  for(const mesh of meshes){
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+  }
+}
+
+// 破壊用ブロック削除
+function removeBlockByMesh(mesh){
+for(const [k,v] of blocks){
+if(v.mesh===mesh){
+scene.remove(v.mesh);
+blocks.delete(k);
+const i=meshes.indexOf(mesh);
+if(i>-1) meshes.splice(i,1);
+break;
+}
+}
+}
+
+// ===== 木生成 =====
+function makeTree(x,z,groundY,chunkBlocks){
+  let y0 = groundY;
+  while(y0>=WORLD_DEPTH){
+    const blk = blocks.get(key(x,y0,z));
+    if(blk && (blk.type==="grass" || blk.type==="dirt")){
+      break;
+    }
+    y0--;
+  }
+  if(y0 < WORLD_DEPTH) return;
+
+  for(let y=1;y<=4;y++){
+    addBlock(x,y0+y,z,"wood");
+    chunkBlocks.push(key(x,y0+y,z));
+  }
+
+  for(let dx=-2;dx<=2;dx++)
+  for(let dz=-2;dz<=2;dz++)
+  for(let dy=3;dy<=5;dy++)
+  if(Math.abs(dx)+Math.abs(dz)<4){
+    addBlock(x+dx,y0+dy,z+dz,"leaves");
+    chunkBlocks.push(key(x+dx,y0+dy,z+dz));
+  }
+}
+
+// ===== チャンク =====
+const generated=new Map();
+function chunkKey(cx,cz){return cx+","+cz;}
+
+function generateChunk(cx, cz){
+    const ck=chunkKey(cx,cz);
+    if(generated.has(ck)) return;
+
+    const chunkBlocks=[];
+
+    for(let x=cx*CHUNK;x<(cx+1)*CHUNK;x++)
+    for(let z=cz*CHUNK;z<(cz+1)*CHUNK;z++){
+
+        const h=Math.floor(Math.sin(x*0.2)+Math.cos(z*0.2));
+
+        for(let y=WORLD_DEPTH;y<-1;y++){
+            addBlock(x,y,z,y===WORLD_DEPTH?"bedrock":"stone");
+            chunkBlocks.push(key(x,y,z));
+        }
+
+        addBlock(x,-1+h,z,"dirt"); chunkBlocks.push(key(x,-1+h,z));
+        addBlock(x,0+h,z,"grass"); chunkBlocks.push(key(x,0+h,z));
+
+        if(Math.random()<0.015){
+            makeTree(x,z,0+h,chunkBlocks);
+        }
+    }
+
+    generated.set(ck,{cx,cz,blocks:chunkBlocks});
+    const px = Math.floor(camera.position.x / CHUNK);
+    const pz = Math.floor(camera.position.z / CHUNK);
+    updateShadowsNearPlayer(px, pz);
+}
+
+// 🔹非表示化のみだが影を常に更新
+function unloadFarChunks(pcX,pcZ){
+  for(const [ck,chunk] of generated){
+    const distX = Math.abs(chunk.cx - pcX);
+    const distZ = Math.abs(chunk.cz - pcZ);
+    const visible = distX<=RENDER && distZ<=RENDER;
+
+    for(const k of chunk.blocks){
+      const b = blocks.get(k);
+      if(b) b.mesh.visible = visible;
+    }
+  }
+  updateAllBlockShadows();
+}
+
+// ===== 安全スポーン =====
+function safeSpawn(){
+for(let dx=-RENDER;dx<=RENDER;dx++)
+for(let dz=-RENDER;dz<=RENDER;dz++)
+generateChunk(dx,dz);
+
+let groundY=0;
+for(let y=50;y>-50;y--){
+if(hasBlock(0,y,0)){ groundY=y; break; }
+}
+camera.position.set(0.5,groundY+1+PLAYER_H,0.5);
+}
+safeSpawn();
+
+// ===== Raycast & 破壊 =====
+const raycaster=new THREE.Raycaster();
+const blockHardness={
+grass:0.8,
+dirt:0.8,
+stone:2,
+wood:1.5,
+leaves:0.4,
+bedrock:Infinity
+};
+
+let breaking=null;
+
+// ===== パーティクル =====
+const particles=[];
+function spawnBreakParticles(pos,color,small=false){
+    for(let i=0;i<8;i++){
+        const size = small ? 0.05 : 0.1;
+        const geo=new THREE.BoxGeometry(size,size,size);
+        const mat=new THREE.MeshLambertMaterial({color});
+        const mesh=new THREE.Mesh(geo,mat);
+        if(small){
+            mesh.position.set(
+                pos.x + 0.25*(Math.random()-0.5)*2,
+                pos.y + 0.25*(Math.random()-0.5)*2,
+                pos.z + 0.25*(Math.random()-0.5)*2
+            );
+        } else {
+            mesh.position.copy(pos);
+        }
+        scene.add(mesh);
+
+        particles.push({
+            mesh,
+            velocity:new THREE.Vector3(
+                (Math.random()-0.5)*2,
+                Math.random()*2,
+                (Math.random()-0.5)*2
+            ),
+            life:1
+        });
+    }
+}
+
+function updateParticles(delta){
+for(let i=particles.length-1;i>=0;i--){
+const p=particles[i];
+p.life-=delta;
+if(p.life<=0){
+scene.remove(p.mesh);
+particles.splice(i,1);
+continue;
+}
+p.mesh.position.addScaledVector(p.velocity,delta);
+p.velocity.y-=9*delta;
+}
+}
+
+// ===== 破壊操作 =====
+document.addEventListener("mousedown",e=>{
+if(!locked || e.button!==0) return;
+
+raycaster.setFromCamera(new THREE.Vector2(0,0),camera);
+const hits=raycaster.intersectObjects(meshes,true);
+if(hits.length===0) return;
+
+const hit=hits[0].object;
+
+let blk=null;
+for(const v of blocks.values()){
+if(v.mesh===hit){blk=v;break;}
+}
+if(!blk) return;
+if(blockHardness[blk.type]===Infinity) return;
+
+breaking={block:blk,progress:0};
+document.getElementById("progressBarContainer").style.display="block";
+});
+
+document.addEventListener("mouseup",()=>{
+breaking=null;
+document.getElementById("progressBarContainer").style.display="none";
+document.getElementById("progressBar").style.width="0%";
+});
+
+document.addEventListener("contextmenu",e=>e.preventDefault());
+
+// 🔹プレイヤー周囲チャンクの影更新
+function updateShadowsNearPlayer(cx, cz) {
+    for (let dx = -RENDER; dx <= RENDER; dx++) {
+        for (let dz = -RENDER; dz <= RENDER; dz++) {
+            const ck = chunkKey(cx + dx, cz + dz);
+            const chunk = generated.get(ck);
+            if (!chunk) continue;
+            for (const k of chunk.blocks) {
+                const b = blocks.get(k);
+                if (b) {
+                    b.mesh.castShadow = true;
+                    b.mesh.receiveShadow = true;
+                }
+            }
+        }
+    }
+}
+
+// 🔹太陽のシャドウカメラをプレイヤー位置に追従
+function updateSunShadowCamera() {
+    const px = camera.position.x;
+    const pz = camera.position.z;
+    const range = CHUNK * (RENDER + 2);
+    sun.position.set(px + 5, 10, pz + 5);
+    sun.shadow.camera.left = -range;
+    sun.shadow.camera.right = range;
+    sun.shadow.camera.top = range;
+    sun.shadow.camera.bottom = -range;
+    sun.shadow.camera.updateProjectionMatrix();
+}
+
+// ===== ループ =====
+let prevTime=performance.now();
+function animate(){
+requestAnimationFrame(animate);
+
+const now=performance.now();
+let delta=(now-prevTime)/1000;
+prevTime=now;
+
+// 衝突付き移動
+const forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw));
+const right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+let move=new THREE.Vector3();
+
+if(keys["KeyW"]) move.add(forward);
+if(keys["KeyS"]) move.sub(forward);
+if(keys["KeyA"]) move.sub(right);
+if(keys["KeyD"]) move.add(right);
+
+if(move.length()>0){
+move.normalize().multiplyScalar(MOVE_SPEED*delta);
+
+let nextX=camera.position.x+move.x;
+let nextZ=camera.position.z+move.z;
+
+const footY=Math.floor(camera.position.y-PLAYER_H);
+const headY=Math.floor(camera.position.y-0.1);
+
+if(
+!hasBlock(Math.floor(nextX),footY,Math.floor(camera.position.z)) &&
+!hasBlock(Math.floor(nextX),headY,Math.floor(camera.position.z))
+){
+camera.position.x=nextX;
+}
+
+if(
+!hasBlock(Math.floor(camera.position.x),footY,Math.floor(nextZ)) &&
+!hasBlock(Math.floor(camera.position.x),headY,Math.floor(nextZ))
+){
+camera.position.z=nextZ;
+}
+}
+
+// 重力
+velocityY+=GRAVITY*delta;
+camera.position.y+=velocityY*delta;
+
+// 地面判定
+const px=Math.floor(camera.position.x);
+const py=Math.floor(camera.position.y-PLAYER_H);
+const pz=Math.floor(camera.position.z);
+
+if(hasBlock(px,py,pz)){
+onGround=true;
+velocityY=0;
+camera.position.y=py+1+PLAYER_H;
+}else{
+onGround=false;
+}
+
+if(keys["Space"] && onGround){
+velocityY=JUMP;
+}
+
+// 破壊進行
+if(breaking){
+breaking.progress += delta;
+const hardness = blockHardness[breaking.block.type];
+const ratio = breaking.progress / hardness;
+document.getElementById("progressBar").style.width = Math.min(ratio*100,100)+"%";
+
+spawnBreakParticles(
+    breaking.block.mesh.position,
+    breaking.block.mesh.material.color.getHex(),
+    true
+);
+
+if(ratio >= 1){
+const color = breaking.block.mesh.material.color.getHex();
+spawnBreakParticles(breaking.block.mesh.position,color,false);
+removeBlockByMesh(breaking.block.mesh);
+breaking = null;
+document.getElementById("progressBarContainer").style.display="none";
+}
+}
+
+updateParticles(delta);
+
+// チャンク表示制御
+const cx = Math.floor(camera.position.x / CHUNK);
+const cz = Math.floor(camera.position.z / CHUNK);
+
+for(let dx=-RENDER; dx<=RENDER; dx++)
+for(let dz=-RENDER; dz<=RENDER; dz++)
+    generateChunk(cx+dx, cz+dz);
+
+unloadFarChunks(cx, cz);
+
+// 影更新
+updateSunShadowCamera();
+updateShadowsNearPlayer(cx, cz);
+renderer.shadowMap.needsUpdate = true;
+
+renderer.render(scene,camera);
+}
+animate();
+
+</script>
+</body>
+</html>
